@@ -1,164 +1,138 @@
 import cv2
 import numpy as np
-import math
+from scipy.spatial.transform import Rotation
 
-__author__ = "Partha Das"
-__license__ = "Free to use and modify as long as I am referred and credited."
 
-class orientedROISelector(object):
-    """Class providing various functionalities for the selecting polygonal ROI and
-    obtaining associated metrics from it.
-    Returns a list of dictionaries, where each of the list elements corresponds to a
-    ROI. Access the list by accessing the ROIs class variable.
-    Each ROI contains the following (The dictionary keys are as labelled here):
-    Polygon: A numpy array of points defining the ROI polygon. Can be directly used
-             with opencv polygon functions without the need to convert.
-    Centroid: A tuple with the coordinate of the centroids of the polygon
-    Center: A tuple with the coordinate of the center of the bounding box of the
-            polygon
-    BoundingBox: The bounding box of the polygon
-    ROIRotation: The rotation of the polygon. Only updated when the user explicitly
-                 sets the rotation by using the rotation guide enabled by the
-                 alternative right and left click. Default is upright, that is zero
-                 degrees for the model used.
-    """
+class Selector():
     
-    def __init__(self, img, windowName=None, autoClose=False):
-        self.img = img
-        self.__backup = self.img.copy()
+    def __init__(self, img, camera_matrix, dist_coeffs, ref_pts, window_name="input"):
+        self.original_img = img
+        self.window_name = window_name
+        self.camera_matrix = camera_matrix
+        self.dist_coeffs = dist_coeffs
+        self.ref_pts = ref_pts
 
-        self.ROIs = []
-        self.__ROICounter = -1
-        
-        self.__polygon = []
-        self.__centroid = []
-        self.__center = []
-        self.__boundingBox = []
-        self.__rotation = 0
-        
-        self.__POLYSELECTION = 0
-        self.__DIRECTION = 1
+        self.n_ref_pts = len(self.ref_pts)
+        self.ref_pt_idx = 0
+        self.selected_pts = []
 
-        self.__mode = self.__POLYSELECTION
+        self.mouse_loc = None
 
-        self.windowName = windowName
-        self.autoClose = autoClose
-        self.__closed = False
+        self.finished = False
+        self.translation = None
+        self.rotation = None
+        self.reproj_pts = None
 
-        self.__prev = ()
+        cv2.imshow(self.window_name, self.original_img)
+        cv2.setMouseCallback(self.window_name, self.mouse_callback)
 
-        if windowName != None:
-            cv2.setMouseCallback(self.windowName, self.click)
+    
+    def display(self):
+        if self.finished:
+            current_img = self.display_result()
         else:
-            self.windowName = "ROI Selection"
-            cv2.imshow(self.windowName, self.img)
-            cv2.setMouseCallback(self.windowName, self.click)
+            current_img = self.display_selector()
+        cv2.imshow(self.window_name, current_img)
 
-    def resetCanvas(self, img):
-        """Function to reset the canvas with the given image. This resets the current ROI in memory, but leaves the entire ROI list untouched.
-        Call this function from the mainloop selectively by listening to specific key strokes."""
-        self.img = img
-        self.__polygon = []
-        self.__centroid = []
-        self.__center = []
-        self.__boundingBox = []
-        self.__rotation = 0
+    
+    def display_result(self):
+        current_img = self.original_img.copy()
+
+        # write text
+        cv2.putText(current_img, "User Selections", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(current_img, "Reprojections", (50, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(current_img, f"x: {self.translation[0]:.3f} m", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(current_img, f"y: {self.translation[1]:.3f} m", (50, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(current_img, f"z: {self.translation[2]:.3f} m", (50, 230), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(current_img, f"roll: {self.rotation[0]:.3f} deg", (50, 270), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(current_img, f"pitch: {self.rotation[1]:.3f} deg", (50, 310), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(current_img, f"yaw: {self.rotation[2]:.3f} deg", (50, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+
+        # draw points and lines
+        for i, pt in enumerate(self.selected_pts):
+            cv2.drawMarker(current_img, pt, (0, 255, 0))
+            if i > 0:
+                prev_pt = self.selected_pts[i-1]
+                cv2.line(current_img, prev_pt, pt, (0, 255, 0), 1, cv2.LINE_AA)
+        first_pt = self.selected_pts[0]
+        last_pt = self.selected_pts[-1]
+        cv2.line(current_img, last_pt, first_pt, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # draw reprojected object
+        for pt in self.reproj_pts[0]:
+            cv2.drawMarker(current_img, pt, (0, 0, 255))
+        cv2.polylines(current_img, [self.reproj_pts], True, (0, 0, 255), 1)
+
+        return current_img
+
+    
+    def display_selector(self):
+        current_img = self.original_img.copy()
+
+        # write text
+        ref_pt_name, _ = self.ref_pts[self.ref_pt_idx]
+        text = f"Select Reference Point: {ref_pt_name}"
+        cv2.putText(current_img, text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+
+        # draw points and lines
+        for i, pt in enumerate(self.selected_pts):
+            cv2.drawMarker(current_img, pt, (0, 255, 0))
+            if i > 0:
+                prev_pt = self.selected_pts[i-1]
+                cv2.line(current_img, prev_pt, pt, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # draw current mouse location
+        if self.ref_pt_idx > 0:
+            last_pt = self.selected_pts[-1]
+            cv2.line(current_img, last_pt, self.mouse_loc, (0, 255, 0), 1, cv2.LINE_AA)
+
+        return current_img
+
+    
+    def write_extrinsics(self):
+        # calc transformation
+        img_pts = np.array(self.selected_pts, dtype=np.float32)
+        obj_pts = np.array([loc for _, loc in self.ref_pts], dtype=np.float32)
+        retval, rvec, tvec = cv2.solvePnP(
+            obj_pts,
+            img_pts,
+            self.camera_matrix,
+            self.dist_coeffs,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE
+        )
+
+        # invert and save
+        transform = np.eye(4)
+        transform[:3, :3] = Rotation.from_rotvec(rvec.flatten()).as_matrix()
+        transform[:3, 3] = tvec.flatten()
+        inv_transform = np.linalg.inv(transform)
+        print(inv_transform)
+        with open('cam_to_world.npy', 'wb') as f:
+            np.save(f, inv_transform)
+
+        # calculate values for display
+        self.translation = inv_transform[:3, 3]
+        self.rotation = Rotation.from_matrix(inv_transform[:3, :3]).as_euler('xyz', degrees=True)
         
-        self.__mode = self.__POLYSELECTION
-        cv2.imshow(self.windowName, self.img)
-        self.__closed = False
+        reproj_pts_raw, _ = cv2.projectPoints(obj_pts, rvec, tvec, self.camera_matrix, self.dist_coeffs)
+        self.reproj_pts = np.round(reproj_pts_raw).astype(np.int32)
 
-    def __updateROI(self):
-        """Internal function that updates the ROI list with the current ROI. The rotation is set to 0 since the default assumption is that of
-        an upright object. The rotation is not updated till the user explicitly marks the orientation"""
-        if len(self.__polygon) > 0:
-
-            mask = np.zeros(self.img.shape[:2], np.uint8)
-            self.__polygon = np.array([self.__polygon], np.int32)
-            cv2.fillPoly(mask, self.__polygon, [255] * 3)
-            (_, contours, _) = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if len(contours) > 0:
-                contours = contours[0]
-                moment = cv2.moments(contours)
-                cx = int(moment["m10"]/moment["m00"])
-                cy = int(moment["m01"]/moment["m00"])
-                rect = cv2.boundingRect(contours)
-                self.__centroid = (cx, cy)
-                self.__boundingBox = rect
-                self.__center = (int(rect[0]+rect[2]/2), int(rect[1]+rect[3]/2))
-                self.__rotation = 0.0
-                tmpDict = {'Polygon': self.__polygon, 'Centroid': self.__centroid, 'Center': self.__center, 'BoundingBox': self.__boundingBox, 'ROIRotation': self.__rotation}
-                self.ROIs.append(tmpDict)
-                self.__polygon = []
-            self.__centroid = []
-            self.__center = []
-            self.__boundingBox = []
-
-    def click(self, event, x, y, flags, param):
-        """Main click event for the mouse. Allowed actions:
-        Left click: If a ROI is open, that is, it is not enclosed, it adds another point, where the mouse clicked to the polygon
-        Right click: If the ROI is open, then it closes the ROI polygon. This was done to make sure that the ROI is closed, since
-                     even a pixel of open ROI, while invisible to the human eye, might wreak havoc for algorithms like flood-fill
-                     and would need further prepocessing (Trust me, I faced it and this solves a bit of the headaches). Updates 
-                     the ROI list automatically when the polygon is closed. If the ROI list is empty, then you probably didn't close
-                     the polygon. Try right clicking next time.
-        Alternative Right click: This is triggered only when the polygon is closed. This starts the orientation mode, recognizable
-                     by a line following the mouse from the centroid of the ROI. This mode is used to specify a guide from which
-                     the orientation of the ROI is to be calculated.
-        Alternative Left click: This is triggered only when the polygon is closed and the orientation mode has started. This
-                     finalizes the orientation to face in the direction where the user clicks. So you get a line from which the 
-                     orientation of the ROI is estimated. The model assumes an upright, right handed, 360 degrees rotational frame.
-                     """
+    
+    def mouse_callback(self, event, x, y, flags, param):
+        if self.finished:
+            return
+        
         if event == cv2.EVENT_FLAG_LBUTTON:
-            if self.__mode == self.__POLYSELECTION:
-                if self.__closed == True:
-                    self.__closed = False
-                if len(self.__polygon) > 0:
-                    prev = self.__polygon[-1]
-                    cv2.line(self.img, (x, y), tuple(prev), [0, 255, 0], 2)
-                    cv2.imshow(self.windowName, self.img)
-                self.__polygon.append([x, y])
-            elif self.__mode == self.__DIRECTION:
-                self.__mode = self.__POLYSELECTION
-                curX = x
-                curY = y
-                # Check quadrant
-                h = math.hypot(x - self.__prev[0], y - self.__prev[1])
-                b = math.hypot(x - x, y - self.__prev[1])
-                angle = math.degrees(math.acos(b/h))
-                if x >= self.__prev[0]:
-                    if y >= self.__prev[1]:
-                        angle = 180 - angle
-                   
-                elif x < self.__prev[0]:
-                    if y > self.__prev[1]:
-                        angle += 180
-                    elif y < self.__prev[1]:
-                        angle = 360 - angle
-                    elif y == self.__prev[1] and x < self.__prev[0]:
-                        angle += 180
-                self.__rotation = angle
-                self.ROIs[self.__ROICounter]['ROIRotation'] = angle
-                        
+            self.selected_pts.append((x, y))
+            print(self.selected_pts)
+            if self.ref_pt_idx == (self.n_ref_pts - 1):
+                self.write_extrinsics()
+                print('finished')
+                self.finished = True
+            else:
+                self.ref_pt_idx += 1
 
-        elif event == cv2.EVENT_FLAG_RBUTTON:
-            if self.__closed == False:
-                if len(self.__polygon) >= 3:
-                    prev = self.__polygon[0]
-                    cur = self.__polygon[-1]
-                    cv2.line(self.img, tuple(cur), tuple(prev), [0, 255, 0], 2)
-                    cv2.imshow(self.windowName, self.img)
-                    self.__closed = True
-                    self.__updateROI()
-                    self.__ROICounter += 1
-            elif self.__closed == True and self.__mode == self.__POLYSELECTION:
-                self.__mode = self.__DIRECTION
-                self.__backup = self.img.copy()
-                self.__prev = self.ROIs[self.__ROICounter]['Centroid']
-                cv2.line(self.img, (x, y), self.__prev, [0, 255, 0], 2)
-                cv2.imshow(self.windowName, self.img)
         elif event == cv2.EVENT_MOUSEMOVE:
-            if self.__mode == self.__DIRECTION:
-                self.img = self.__backup.copy()
-                cv2.line(self.img, (x,y), self.__prev, [0, 255, 0], 2)
-                cv2.imshow(self.windowName, self.img)
+            self.mouse_loc = (x, y)
+            

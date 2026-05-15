@@ -83,6 +83,7 @@ class Selector():
                 cv2.line(current_img, prev_pt, pt, (0, 255, 0), 1, cv2.LINE_AA)
 
         # draw current mouse location
+        cv2.drawMarker(current_img, self.mouse_loc, (0, 255, 0))
         if self.ref_pt_idx > 0:
             last_pt = self.selected_pts[-1]
             cv2.line(current_img, last_pt, self.mouse_loc, (0, 255, 0), 1, cv2.LINE_AA)
@@ -106,14 +107,13 @@ class Selector():
         transform = np.eye(4)
         transform[:3, :3] = Rotation.from_rotvec(rvec.flatten()).as_matrix()
         transform[:3, 3] = tvec.flatten()
-        inv_transform = np.linalg.inv(transform)
-        print(inv_transform)
+        print(transform)
         with open('cam_to_world.npy', 'wb') as f:
-            np.save(f, inv_transform)
+            np.save(f, transform)
 
         # calculate values for display
-        self.translation = inv_transform[:3, 3]
-        self.rotation = Rotation.from_matrix(inv_transform[:3, :3]).as_euler('xyz', degrees=True)
+        self.translation = transform[:3, 3]
+        self.rotation = Rotation.from_matrix(transform[:3, :3]).as_euler('xyz', degrees=True)
         
         reproj_pts_raw, _ = cv2.projectPoints(obj_pts, rvec, tvec, self.camera_matrix, self.dist_coeffs)
         self.reproj_pts = np.round(reproj_pts_raw).astype(np.int32)
